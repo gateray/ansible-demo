@@ -1,0 +1,150 @@
+---
+- hosts: api.ab    #应用组名
+  remote_user: root
+#  serial: "60%"
+  max_fail_percentage: 30
+  gather_facts: False
+  vars:
+    # 是否回滚(更新时应设置为False,回滚时应设置为True)
+    comeback: False
+    # 回滚的时间点(回滚时需要设置)
+    comebacktimepoint: 20151030@145947
+    # 需要更新的服务名称
+    servicename: "api.ab"
+    # 服务对应的tomcat web根目录
+    projectdir: /usr/local/api.ab/webapps/ROOT
+    # 备份路径
+    backupbasedir: /backup/api.ab
+    backupwardir: "{{ backupbasedir }}/war"
+    backupjardir: "{{ backupbasedir }}/jar"
+    backupclassdir: "{{ backupbasedir }}/class"
+    backupstaticdir: "{{ backupbasedir}}/static"
+    # 涉及的更新类型
+    updatetype:
+      - war
+      #- jar
+      #- class 
+      #- static
+    # 如果updatetype包含class类型,需要设置如下变量,用于指定remote的临时上传目录
+    remotesrc: /tmp/remotesrc/api.ab/classes
+  tasks:
+    - name: get local datetime
+      shell: ./scripts/getbackuptime.sh {{ servicename }}
+      run_once: true
+      delegate_to: 127.0.0.1
+      register: dt_result
+      when: not comeback
+
+    - name: set dtstr variable
+      local_action: set_fact dtstr={{ dt_result.stdout_lines[0] }}
+      run_once: true
+      delegate_to: 127.0.0.1
+      when: not comeback
+    
+    - name: ensure rsync is present
+      yum: name=rsync state=present
+      when: not comeback
+
+    - name: create a backup dir if not exist
+      file: path={{ item }} state=directory
+      with_items:
+        - "{{ backupwardir }}"
+        - "{{ backupjardir }}"
+        - "{{ backupclassdir }}"
+        - "{{ backupstaticdir }}"
+      when: not comeback
+ 
+    - name: "[war] backup project ROOT"
+      shell: "chdir={{ projectdir }} jar c * > {{ backupwardir }}/{{ dtstr }}.war"
+      when: "'war' in updatetype and not comeback"
+     
+    - name: "[war] unpack .war to project ROOT"
+      unarchive: src={{ item }} dest={{ projectdir }}
+      when: "'war' in updatetype and not comeback"
+      with_fileglob:
+        - files/wars/*
+      notify: restart tomcat
+
+    - name: "[war] rollback .war to project ROOT"
+      unarchive: src={{ backupwardir }}/{{ comebacktimepoint }}.war dest={{ projectdir }} copy=no
+      when: "'war' in updatetype and comeback"
+      notify: restart tomcat
+
+    - name: "[jar] backup jar files"
+      shell: cp {{ projectdir }}/WEB-INF/lib/{{ item | basename }} {{ backupjardir }}/{{ dtstr }}.{{ item | basename }} || /bin/true
+      when: "'jar' in updatetype and not comeback"
+      with_fileglob:
+        - files/jars/*
+   
+    - name: "[jar] upload .jar files"
+      copy: src={{ item }} dest={{ projectdir }}/WEB-INF/lib
+      when: "'jar' in updatetype and not comeback"
+      with_fileglob:
+        - files/jars/*
+      notify: restart tomcat
+
+    - name: "[jar] rollback .jar files"
+      shell: >
+        for filename in `ls -1 {{ backupjardir }}/{{ comebacktimepoint }}.*`; do
+          jarname=${filename#*.}
+          cp ${filename}} {{ projectdir }}/WEB-INF/lib/${jarname} 
+        done
+      when: "'jar' in updatetype and comeback"
+      notify: restart tomcat
+
+    - name: "[class] create upload tmp dir"
+      file: path={{ remotesrc }} state=directory
+      when: "'class' in updatetype and not comeback"
+
+    - name: "[class] copy local java files to remote tmp dir"
+      copy: src={{ item }} dest={{ remotesrc }}
+      when: "'class' in updatetype and not comeback"
+      with_fileglob:
+        - files/classes/*
+    
+    - name: "[class] execute java files backup and smartupdate"
+      script: ./scripts/smartupdate.sh {{ projectdir }} {{ item | basename }} {{ remotesrc }} {{ backupclassdir }}
+      when: "'class' in updatetype and not comeback"
+      with_fileglob:
+        - files/classes/*
+      notify: restart tomcat
+
+    - name: "[class] pack backup files"
+      shell: "chdir={{ backupclassdir }} tar --exclude='*.tgz' -cvzf {{ dtstr }}.tgz * | xargs rm -rf"
+      when: "'class' in updatetype and not comeback"
+
+    - name: "[class] rollback java files"
+      unarchive: copy=no src={{ backupclassdir }}/{{ comebacktimepoint }}.tgz dest={{ projectdir }}
+      when: "'class' in updatetype and comeback"
+      notify: restart tomcat
+
+    - name: "[static] initial staticfiles variable"
+      command: ls -1 files/statics
+      run_once: true
+      delegate_to: 127.0.0.1
+      register: staticfiles
+      when: "'static' in updatetype and not comeback"
+    
+    - name: "[static] backup static files"
+      #shell: >
+      #  chdir={{ projectdir }} 
+      #  find ./ -name {{ item | basename }} | xargs -i tar cf - {} | tar xf - -C {{ backupstaticdir }}
+      shell: echo 'backup...'
+      with_items: "{{ staticfiles.stdout_lines | default([]) }}"
+      when: "'static' in updatetype and not comeback"
+
+    - name: "[static] pack backup files"
+      shell: "chdir={{ backupstaticdir }} tar --exclude='*.tgz' -cvzf {{ dtstr }}.tgz * | xargs rm -rf"
+      when: "'static' in updatetype and not comeback"
+    
+    - name: "[static] upload files"
+      synchronize: src=files/statics/ dest={{ projectdir }}
+      when: "'static' in updatetype and not comeback"
+
+    - name: "[static] rollback files"
+      unarchive: copy=no src={{ backupstaticdir }}/{{ comebacktimepoint }}.tgz dest={{ projectdir }}
+      when: "'static' in updatetype and comeback"
+     
+  handlers:
+    - name: restart tomcat
+      service: name={{ servicename }} state=restarted   
